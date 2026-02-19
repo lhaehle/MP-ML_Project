@@ -1,0 +1,205 @@
+before:
+    - done:
+        - read emails thoroughly -> done
+        - understand registration data availability timing -> Done
+            - for current 3-state data
+            - for MP db
+        - define timing for data availability, NVI_received_dt -> Done
+        - use vehicle count: NVI_VIN_COUNT -> Done
+            in tmp.csv currently:
+            [NVI_VIN_COUNT]: 1 to 10
+            [SLS_COUNT]: -2 to 6 
+            -> as we are analyzing only registered vehicles, use NVI_VIN_COUNT
+        - dataset tmp.csv: -> Done
+            is_recent    False   True  TOTAL
+            is_reported
+            False         1943    787   2730
+            True         38228  18171  56399
+            TOTAL        40171  18958  59129
+        - understand timing hierarchy for nowcasting (and reconciliation?). day - week - month - year
+            - accumulate learning over time? or just one-shot for now?
+        - understand reconciliation end-2-end. different methods? overall consistency? performance?
+        - extend hierarchies, including county... given Axels mail. 
+            - Which levels to start with?
+        - re-generate source
+            - separate nowcasting per config from hierarchical reconciliation
+            - separate reporting
+        - test run
+        - data overview:
+            is_recent    False   True  TOTAL
+            is_reported
+            False         1943    787   2730
+            True         38228  18171  56399
+            TOTAL        40171  18958  59129
+ 
+        - remove dead variables/code if 0...
+
+31.12.25:
+    - revisited nowcasting vs. retrofitting registrations: https://claude.ai/chat/4747401d-0beb-4b31-adec-a7dd909368cd
+    - introduction of cutoff_train and cutoff_test
+    - -> resulting in tabular_6.py
+    - checking what predicted 0.0000 in print_level_bins('micro', 'linear_extrapolation', debug.dim_registry) output means
+        - disecting: 4 fundamental cases for non-reporting brand cars resulting from (1) car registration known < t (i.e. it is in the training data) yes/no combined with (2) car registration received <T (i.e. it is in test data) yes/no
+        - continued next day...
+
+1.1.26
+    - full analysis of prediction cases:
+        - be aware: 
+            analysis is per bin veh x geo x SALE-time. a 2nd car sold later is in a different bin! 
+            2 independent sales at most sparse level is extremely unlikely -> ignore
+            ? what happens at more aggregated levels?
+        - reg <= t: requires sale date <= t
+            - reg <= T: known in training by reg <= t, uninteresting
+            - reg > T: impossible as t<=T
+        - reg > t:
+            - sale ≤ t: IN training (sale ≤ t AND reg > t)
+                - reg ≤ T: not in test → KNOWN_IN_TEST (sale≤t, t<reg≤T, uninteresting as known)
+                - reg > T: IN test → STILL_UNREG (sale≤t, reg>T, still unregistered, pred>0)
+            - sale > t: NOT in training
+                - sale ≤ T: (sold between t and T)
+                    - reg ≤ T: not in test → uninteresting (sold & registered between t and T)
+                    - reg > T: IN test (t<sale≤T, reg>T)
+                        - group (veh×geo) in training: → NEW_SALE (pred>0)
+                        - group (veh×geo) not in training: → NEW_GROUP (pred=0)
+                - sale > T: not in test → uninteresting (future sale)
+
+        result:
+        ================================================================================
+        Status          Count     Pred Sum   Actual Sum Note
+        ------------ -------- ------------ ------------ -----------------------------------
+        NEW_BIN           261         0.00       263.00 Group new, sale> t, pred=0 (not possible to predict at this level of detailing)
+        NEW_DATE           30         2.97        30.00 Group known, sale >t, reg > T: prediction>0
+        REG_BY_T          329          N/A       343.00 Sold ≤t, reg (t,T] (known at test time, no need to predict)
+        REG_AFTER_T       316       227.41       317.00 Sold ≤t, reg>T (still missing)
+        ------------ -------- ------------ ------------
+        TOTAL             936       230.38       953.00
+
+        Test target breakdown:
+        NEW_BIN (pred=0):      261 bins,    263 cars missed
+        NEW_DATE (pred>0):      30 bins,     30 cars
+        REG_AFTER_T:           316 bins,    317 cars
+        ---
+        Total test:            607 bins,    610 cars
+
+        Train target resolved by T (REG_BY_T): 329 bins, 343 cars
+        =====================================================================================================
+    - sanity checked nowcasting models -> ok
+    - now optimizing reconciliation
+    - implement warnings when using fallbacks
+    - not clocked: working with claude.de and its workspace
+    - reconciliation matrix and optimizer implemented
+    - results plausible
+    - improved features:
+        - made toggle switch USE_PRICE for price features. comparison: not much of an effect
+        - asked to generate more features for use, with USE_MORE toggle switch. -> proposed features not very intuitive -> aborted
+        - added 1-hot encoding for weekdays. feature toggle USE_1HOT_WEEKDAYS. values in optimization matrix improve slightly (~1% roughly).
+        -> File matrix_1d.py
+    - improve modeling:
+        - crostonSBA: not fit for this problem. keep anyway!
+        - otherwise many optimizations
+        -> file matrix_1e.py
+
+2.1.26
+    - check independence of training and testing
+        - currently overlapping car sale < t, and car registration > T.
+        - resolving by removing registered cars > T from training (like in production setting, late registrations are unknown)
+        -> file matrix_1f.py
+    - checking if we are learning enough "how cars sell" in training data. Answer: no.
+        - implementin cohort curves, with additional history time separator t_h.
+        -> file matrix_1h
+        - however, results are hard to interpret. 
+        - are we solving the right problem? the cohorts focus on registration delay, but the key is probably learning how cars sell
+        -> investigate new. start over
+    - revisit "how cars sell" & "how they register": https://claude.ai/chat/8510761b-bf73-4b28-866d-43ed4842a425
+        - prompt:
+            let us reconsider the options to learn "how cars sell" and "how cars register" for the following situation. 
+            Assume we have multiple years of recorded data. 
+            In production, we want to estimate the still unregistered vehicles of non-reporting brands based for bins at different aggregation levels based on currently known data. 
+            currently known data includes instant information about vehicles of reporting brands. 
+            However from non-reporting brands, registration info comes in late. 
+            in development, we need to go back in time to a time point t and estimate with data that was available at t, and then evaluate that estimate with data that came in by now. 
+            which methodologies for learning and testing/evaluating are suitable for this problem? 
+            think through options in terms of (1) basic explanation, (2) migration path from existing code and its complexity, (4) computational complexity, (5) expected improvement quality, 
+                (6) other pro/con. 
+            then give a matrix to compare the methodologies by relevant criteria.
+            -> choose M5, "delay convolution".
+        - Next: how to model the registration distribution? -> "stratified" (=devided in subgroups, "strata") to state & non-reporting brand
+            -> prompt (start): ok. i decide for using M5. Now I have several questions. 
+                (1) the delay distribution at least depends on the state, and may depend on other factors, e.g. day of the month (in the case of monthly government reporting etc). 
+                which options exist for P, how performant and how complex are they, and what is a good compromise? 
+                -> A ton of options (empirical, weibull, survival...), -> choose dead simple: empirical per state & per non-reporting brand
+        - timing: modeling and configuration
+            also various models, I decide for using M5, "delay convolution".
+            next decision: model the registration delay distribution as purely empirical, stratified by state and brand. 
+            What are good options to build training and testing configuration at dev time to optimize sales estimator models (reuse, maybe optimized) and reconciliation methods?  
+            think through options in terms of (1) basic explanation, (2) migration path from existing code and its complexity, (3) computational complexity, (4) expected improvement quality, 
+            (5) other pro/con. then give a matrix to compare the methodologies by relevant criteria.
+            -> many options, C7 seems best "Production simulation" (i.e. have several sampling times)
+        - side question: for training/testing is it better to split data by state, rather than by time? -> no
+            - nowcasting is a timing-related question.
+            - testing by state fits to questions around regional expansion (would this fit in mexico?)
+        - go back to timing: check C7. seems good, allows for cross-vehicle and cross-geo learning.
+            - problem: in production, does not learn from several sampling times. sampling times are just to see statistics of several situation.
+            - can avoid this by manually sampling by setting two pairs of cutoff_train and cutoff_test and comparing
+        - try different approach: learn from all times. try to predict non-registered cars for all times.
+            - long analysis...
+                - features (known at the time):
+                    X(b) = [reporting_sales(b),      # Reporting brand sales in bin
+                            registered_by_t(b),      # Non-reporting registrations known at t
+                            lag = t - s  ]            # Days since sale period
+                - training target: 
+                    observed_gap = registered_by_T(b) - registered_by_t(b)
+                    fraction_complete = delay_dist.cdf(T - s, brand, state)
+                    target = observed_gap / max(fraction_complete, 0.5)
+            - existing problem: computational overhead: x number of time bins during training! also: forecast done for many times, only the last is actually needed (compu)
+            - suspected problem: 
+                - all learning should be available at inference of last time - but it is not. every inference time point is trained separately. -> is it?
+                - no:
+                    lag feature: helps to learn the process of incomplete registrations (which percentage is missing at what lag)
+                    reporting feature: helps to learn the total amount of non-reporting sales 
+3.1.26
+    - continue analysis...
+    - in production I have more time bins. problem? -> no. "Model predicts missing for each bin you supply. No more, no less.". missing can then be summed up
+    - could i modify the model & training set-up so the model is trained for cumulative total (rather than per-day) missing sales on each day? -> 
+      -> Short Answer: Possible, but loses key advantages. Better to sum per-day predictions.
+    - if i switch from estimating non-reporting yet-unknown registrations per bin to estimating sales per bin? what would change?
+      -> This is correct but doesn't learn the reporting→eventual relationship as strongly.
+    - trial implementation: results are not good.
+
+
+4.1.26
+    - try this approach with a clean new chat: https://claude.ai/chat/dddf18c9-7abe-4d54-b705-0bd4d36f7f50
+        - trial implementation and several improvement loops. some mediocre results, various loose ends -> abort
+    - continue on https://claude.ai/chat/8510761b-bf73-4b28-866d-43ed4842a425 
+        - implement/test/add again reporting functions. 
+        - croston_sba
+        - output of *_v3.py: better at row/left=a,right=b: 1a, 1b, 3b, 5a, 5b, 6a, 6c. More than 50% better, esp. better at low and high aggregation levels.
+            ===============================================================================================================================================================================
+            OPTIMUM SEARCH ANALYSIS: Best reconciliation parameters per level pair
+            ===============================================================================================================================================================================
+            Recon Pair                              |   Method          A% det_model              agg_model              |   Method          B% det_model              agg_model
+            -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            micro -> model_county_day               |  bottom_up      36.1 croston_sba            zero                   |  bottom_up      35.8 croston_sba            zero
+            model_county_day -> brand_county_day    |  bottom_up      47.5 croston_sba            zero                   |  bottom_up      45.7 croston_sba            zero
+            brand_county_day -> brand_county_week   |    mint         75.9 croston_sba            zero                   |    mint         55.8 croston_sba            zero
+            brand_county_week -> brand_state_week   |     wls         77.7 linear_extrapolation   lightgbm               |    mint         51.5 linear_extrapolation   zero
+            brand_state_week -> brand_state_all     |    mint         68.5 linear_extrapolation   zero                   |    mint         21.9 linear_extrapolation   catboost
+            brand_state_all -> state_all            |    mint         16.9 linear_extrapolation   lightgbm               |    mint         11.9 linear_extrapolation   random_forest
+            ===============================================================================================================================================================================
+        - output of _1f.py
+            ===============================================================================================================================================================================
+            OPTIMUM SEARCH ANALYSIS: Best reconciliation parameters per level pair
+            ===============================================================================================================================================================================
+            Recon Pair                              |   Method          A% det_model              agg_model              |   Method          B% det_model              agg_model
+            -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+            micro -> model_county_day               |  top_down       52.4 zero                   croston_sba            |  top_down       52.4 zero                   croston_sba
+            model_county_day -> brand_county_day    |    mint         44.6 croston_sba            elastic_net            |    mint         40.3 croston_sba            elastic_net
+            brand_county_day -> brand_county_week   |    mint         42.6 elastic_net            zero                   |    mint         38.1 elastic_net            zero
+            brand_county_week -> brand_state_week   |    mint         62.8 croston_sba            zero                   |    mint         41.1 croston_sba            zero
+            brand_state_week -> brand_state_all     |     wls         77.2 croston_sba            catboost               |     wls         37.5 croston_sba            catboost
+            brand_state_all -> state_all            |     wls         44.3 croston_sba            catboost               |    mint         13.1 catboost               croston_sba
+            ===============================================================================================================================================================================
+
+
+
+    

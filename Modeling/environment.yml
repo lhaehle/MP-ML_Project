@@ -1,0 +1,19 @@
+name: mp_stable
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  # Data
+  - pandas=2.3
+  - numpy=1.24
+  - sqlalchemy=2.0
+  - pyodbc=5.2
+  # ML
+  - scikit-learn=1.7
+  - lightgbm=4.6
+  - catboost=1.2
+  - xgboost=2.1
+  # Visualization
+  - matplotlib=3.10
+  - plotly=6.5
